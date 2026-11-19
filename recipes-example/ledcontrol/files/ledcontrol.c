@@ -79,59 +79,40 @@ static struct gpiod_line_request *request_line(const char* chip_path, unsigned i
     return req;
 }
 
-int main(int argc, char** argv)
+int main(void)
 {
-    if(argc < 3)
-    {
-        fprintf(stderr, "usage: %s <0-3> <on|blink [times]>\n", argv[0]);
-        return 1;
-    }
-
-    int led = atoi(argv[1]);
-    if(led < 0 || led > 3)
-    {
-        fprintf(stderr, "LED must be 0-3\n");
-        return 1;
-    }
-
     char chip_path[64];
+
     if(find_gpio1_chip(chip_path, sizeof chip_path))
     {
         fprintf(stderr, "could not find the GPIO1 controller");
         return 1;
     }
 
-    unsigned int offset = FIRST_LINE + led;
+    unsigned int offset = FIRST_LINE;
     struct gpiod_line_request *req = request_line(chip_path, offset);
     if(!req) return 1;
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    int ret = 0;
-    if(!strcmp(argv[2], "on")) 
+    enum gpiod_line_value val = GPIOD_LINE_VALUE_INACTIVE;
+
+    while(!stop)
     {
-        gpiod_line_request_set_value(req, offset, GPIOD_LINE_VALUE_ACTIVE);
-        while(!stop)        // the line is released when we exit
-            pause();
-    }
-    //else if(!strcmp(argv[2], "off")) return led_set(n, 0) ? 1 : 0;
-    else if(!strcmp(argv[2], "blink"))
-    {
-        int times = argc > 3 ? atoi(argv[3]) : 10;
-        for (int i = 0; i < times && !stop; i++)
+        val = (val == GPIOD_LINE_VALUE_INACTIVE) ? GPIOD_LINE_VALUE_ACTIVE : GPIOD_LINE_VALUE_INACTIVE;
+        
+        if (gpiod_line_request_set_value(req, offset, val) < 0)
         {
-            gpiod_line_request_set_value(req, offset, GPIOD_LINE_VALUE_ACTIVE); 
-            usleep(500000);
-            gpiod_line_request_set_value(req, offset, GPIOD_LINE_VALUE_INACTIVE); 
-            usleep(500000);
+            perror("gpiod_line_request_set_value");
+            break;
         }
+
+        usleep(500000);
     }
-    else
-    {
-        fprintf(stderr, "unknown command '%s'\n", argv[2]);
-        ret = 1;
-    }
+
+    gpiod_line_request_set_value(req, offset, GPIOD_LINE_VALUE_INACTIVE);
+    gpiod_line_request_release(req);
     
-    return ret;
+    return 0;
 }
