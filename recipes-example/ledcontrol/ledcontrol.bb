@@ -8,8 +8,10 @@ SRC_URI = "file://ledcontrol.c"
 
 S = "${WORKDIR}/build"
 
+DEPENDS = "libgpiod"
+
 do_compile(){
-    ${CC} ${CFLAGS} ${LDFLAGS} ${WORKDIR}/ledcontrol.c -o ${S}/ledcontrol
+    ${CC} ${CFLAGS} ${LDFLAGS} ${WORKDIR}/ledcontrol.c -o ${S}/ledcontrol -lgpiod
 }
 
 do_install(){

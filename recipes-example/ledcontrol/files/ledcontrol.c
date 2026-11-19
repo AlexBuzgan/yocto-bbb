@@ -1,140 +1,89 @@
-#include<stdio.h>
-#include<stdlib.h>
-#include<string.h>
-#include<fcntl.h>
-#include<errno.h>
-#include<unistd.h>
-
-#ifdef SMOKETEST
-
-#define FILE_PATH   "/dev/my_device"
-#define SIZE        256
-
-char buf[SIZE];
-
-int main(int argc, char **argv)
-{
-    if (argc == 1)
-    {
-        // open the file in read mode
-        int fd = open(FILE_PATH, O_RDONLY);
-        if (fd < 0) { perror("open"); return 1; }
-
-        ssize_t n; // number of bytes copied
-        // read all strings in the character device driver
-        while((n = read(fd, buf, sizeof(buf))) != 0)
-        {
-            if(n < 0)
-            {
-                if(errno == EINTR)  continue;
-                perror("read");
-                close(fd);
-                return 1;
-            }
-            fwrite(buf, 1, n, stdout); // print the read data
-        }
-
-        close(fd);
-    }
-    else
-    {
-        /* open the file in write mode */
-        int fd = open(FILE_PATH, O_WRONLY);
-        if (fd < 0) { perror("open"); return 1; }
-
-        // send every string in the argument to the character device driver
-        for(int i = 1; i < argc; i++)
-        {
-            write(fd, argv[i], strlen(argv[i]));
-        }
-
-        close(fd);
-    }
-    
-    return 0;
-}
-
-#else // SMOKETEST
-
 // real led controling app
 #define _GNU_SOURCE
-#include <dirent.h>
 #include <errno.h>
 #include <limits.h>
+#include <gpiod.h>
 #include <stdio.h>
-#include <stdlib.h>>
+#include <signal.h>
+#include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
-#define GPIO_ROOT   "/sys/class/gpio"
 #define GPIO1_ADDR  "4804c000.gpio" // GPIO controller on the AM335x
 #define FIRST_LINE  21 // USR0 = GPIO1_21 ... USR3 = GPIO1_24
 
-static int write_str(const char* path, const char *val)
+static volatile sig_atomic_t stop;
+static void on_signal(int sig)
 {
-    FILE *f = fopen(path, "w");
-
-    if (!f) { perror(path); return -1; }
-    if(fputs(val, f) == EOF) { perror(path); fclose(f); return -1; }
-    return fclose(f);
+    (void)sig;
+    stop = 1;
 }
 
-// find the sysfs base number of the GPIO1 chip by its HW address
-static int find_gpio1_base(void)
+// find the /dev/gpiochipN that belongs to the GPIO1 controller
+static int find_gpio1_chip(char *out, size_t len)
 {
-    DIR *d = opendir(GPIO_ROOT);
-    struct dirent *e;
-    int base = -1;
-
-    if(!d) { perror(GPIO_ROOT); return -1; }
-    while (e = readdir(d))
+    for (int i = 0; i < 8; i++)
     {
-        char link[PATH_MAX], real[PATH_MAX], bpath[PATH_MAX];
-        if(strncmp(e->d_name, "gpiochip", 8) != 0) continue;
-        snprintf(link, sizeof link, GPIO_ROOT "/%s/device", e->d_name);
-        
-        if(!realpath(link, real) || !strstr(real, GPIO1_ADDR)) continue;
-        snprintf(bpath, sizeof bpath, GPIO_ROOT "/%s/base", e->d_name);
+        char link[PATH_MAX], real[PATH_MAX];
+        snprintf(link, sizeof link, "/sys/bus/gpio/devices/gpiochip%d", i);
 
-        FILE *f = fopen(bpath, "r");
-        if(f) { if(fscanf(f, "%d", &base) != 1) base = -1; fclose(f); }
-        break;
+        if(realpath(link, real) && strstr(real, GPIO1_ADDR))
+        {
+            snprintf(out, len, "/dev/gpiochip%d", i);
+            return 0;
+        }
     }
-    closedir(d);
-    return base;
+    return -1;
 }
 
-static int led_open(int base, int led)
+static struct gpiod_line_request *request_line(const char* chip_path, unsigned int offset)
 {
-    int n = base + FIRST_LINE + led;
-    char path[PATH_MAX], num[16];
+    struct gpiod_chip *chip = NULL;
+    struct gpiod_line_settings *settings = NULL;
+    struct gpiod_line_config *lcfg = NULL;
+    struct gpiod_request_config *rcfg = NULL;
+    struct gpiod_line_request *req = NULL;
+    
+    chip = gpiod_chip_open(chip_path);
+    if(!chip) { perror(chip_path); return NULL; }
 
-    snprintf(path, sizeof path, GPIO_ROOT "/gpio%d", n);
-    struct stat st;
-    if(stat(path, &st) != 0) // not exported yet
+    settings = gpiod_line_settings_new();
+    lcfg = gpiod_line_config_new();
+    rcfg = gpiod_request_config_new();
+
+    if(settings && lcfg && rcfg)
     {
-        snprintf(num, sizeof num, "%d", n);
-        if(write_str(GPIO_ROOT "/export", num) != 0) return -1;
+        gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
+        gpiod_line_settings_set_output_value(settings, GPIOD_LINE_VALUE_INACTIVE);
+
+        if(!gpiod_line_config_add_line_settings(lcfg, &offset, 1, settings))
+        {
+            gpiod_request_config_set_consumer(rcfg, "ledcontrol");
+            req = gpiod_chip_request_lines(chip, rcfg, lcfg);
+
+            if(!req) perror("request lines(is the pin already in use?)");
+        }
+        else
+        {
+            perror("add line settings");
+        }
     }
-    snprintf(path, sizeof path, GPIO_ROOT "/gpio%d/direction", n);
-    if(write_str(path, "out") != 0) return -1;
-
-    return n;
-}
-
-static int led_set(int n, int on)
-{
-    char path[PATH_MAX];
-    snprintf(path, sizeof path, GPIO_ROOT "/gpio%d/value", n);
-    return write_str(path, on ? "1" : "0");
+    else
+    {
+        perror("alloc");
+    }
+    gpiod_request_config_free(rcfg);
+    gpiod_line_config_free(lcfg);
+    gpiod_line_settings_free(settings);
+    gpiod_chip_close(chip);
+    return req;
 }
 
 int main(int argc, char** argv)
 {
     if(argc < 3)
     {
-        fprintf(stderr, "usage: %s <0-3> <on|off|blink [times]>\n", argv[0]);
+        fprintf(stderr, "usage: %s <0-3> <on|blink [times]>\n", argv[0]);
         return 1;
     }
 
@@ -145,30 +94,44 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    int base = find_gpio1_base();
-    if(base < 0)
+    char chip_path[64];
+    if(find_gpio1_chip(chip_path, sizeof chip_path))
     {
         fprintf(stderr, "could not find the GPIO1 controller");
         return 1;
     }
 
-    int n = led_open(base, led);
-    if (n < 0) return 1;
+    unsigned int offset = FIRST_LINE + led;
+    struct gpiod_line_request *req = request_line(chip_path, offset);
+    if(!req) return 1;
 
-    if(!strcmp(argv[2], "on")) return led_set(n, 1) ? 1: 0;
-    else if(!strcmp(argv[2], "off")) return led_set(n, 0) ? 1 : 0;
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    int ret = 0;
+    if(!strcmp(argv[2], "on")) 
+    {
+        gpiod_line_request_set_value(req, offset, GPIOD_LINE_VALUE_ACTIVE);
+        while(!stop)        // the line is released when we exit
+            pause();
+    }
+    //else if(!strcmp(argv[2], "off")) return led_set(n, 0) ? 1 : 0;
     else if(!strcmp(argv[2], "blink"))
     {
         int times = argc > 3 ? atoi(argv[3]) : 10;
-        for (int i = 0; i < times; i++)
+        for (int i = 0; i < times && !stop; i++)
         {
-            led_set(n, 1); usleep(500000);
-            led_set(n, 0); usleep(500000);
+            gpiod_line_request_set_value(req, offset, GPIOD_LINE_VALUE_ACTIVE); 
+            usleep(500000);
+            gpiod_line_request_set_value(req, offset, GPIOD_LINE_VALUE_INACTIVE); 
+            usleep(500000);
         }
-        return 0;
     }
-    fprintf(stderr, "unknown command '%s'\n", argv[2]);
-    return 1;
+    else
+    {
+        fprintf(stderr, "unknown command '%s'\n", argv[2]);
+        ret = 1;
+    }
+    
+    return ret;
 }
-
-#endif // SMOKETEST
